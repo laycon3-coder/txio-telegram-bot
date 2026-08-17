@@ -8,20 +8,34 @@ import {
   formatPullRequestEvent,
   formatWorkflowRunEvent,
 } from "./formatters.js";
+import { shouldProcessDelivery } from "./dedupe.js";
 
 export const webhooks = new Webhooks({ secret: config.githubWebhookSecret });
 
+function handleEvent(event: { id?: string }, handler: () => Promise<void>): Promise<void> {
+  if (!shouldProcessDelivery(event.id)) {
+    console.log(`Skipping duplicate GitHub delivery: ${event.id}`);
+    return Promise.resolve();
+  }
+
+  return handler();
+}
+
 webhooks.on(["issues.opened", "issues.closed", "issues.reopened"], async (event) => {
-  await notifyChannel(formatIssueEvent(event), config.topicThreads.issues);
+  await handleEvent(event, async () => {
+    await notifyChannel(formatIssueEvent(event), config.topicThreads.issues);
+  });
 });
 
 webhooks.on(["pull_request.opened", "pull_request.closed", "pull_request.reopened"], async (event) => {
-  const message = formatPullRequestEvent(event);
-  if (config.pullRequestChatId) {
-    await sendMessage(config.pullRequestChatId, message);
-  } else {
-    await notifyChannel(message);
-  }
+  await handleEvent(event, async () => {
+    const message = formatPullRequestEvent(event);
+    if (config.pullRequestChatId) {
+      await sendMessage(config.pullRequestChatId, message);
+    } else {
+      await notifyChannel(message);
+    }
+  });
 });
 
 // GitHub computes `mergeable` asynchronously, so it's often null on the
@@ -43,20 +57,26 @@ async function isMergeConflicted(
 }
 
 webhooks.on(["pull_request.opened", "pull_request.synchronize", "pull_request.reopened"], async (event) => {
-  const { pull_request: pr, repository } = event.payload;
-  if (!(await isMergeConflicted(pr, repository))) return;
-  const message = formatMergeConflictEvent(pr, repository);
-  const target = config.pullRequestChatId ?? config.telegramChatId;
-  await sendMessage(target, message);
+  await handleEvent(event, async () => {
+    const { pull_request: pr, repository } = event.payload;
+    if (!(await isMergeConflicted(pr, repository))) return;
+    const message = formatMergeConflictEvent(pr, repository);
+    const target = config.pullRequestChatId ?? config.telegramChatId;
+    await sendMessage(target, message);
+  });
 });
 
 webhooks.on("workflow_run.completed", async (event) => {
-  const message = formatWorkflowRunEvent(event);
-  if (message) await notifyChannel(message, config.topicThreads.ci);
+  await handleEvent(event, async () => {
+    const message = formatWorkflowRunEvent(event);
+    if (message) await notifyChannel(message, config.topicThreads.ci);
+  });
 });
 
 webhooks.on("deployment_status.created", async (event) => {
-  await notifyChannel(formatDeploymentStatusEvent(event), config.topicThreads.deploys);
+  await handleEvent(event, async () => {
+    await notifyChannel(formatDeploymentStatusEvent(event), config.topicThreads.deploys);
+  });
 });
 
 webhooks.onError((error) => {
